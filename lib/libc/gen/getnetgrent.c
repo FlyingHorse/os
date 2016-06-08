@@ -36,7 +36,6 @@ static char sccsid[] = "@(#)getnetgrent.c	8.2 (Berkeley) 4/27/95";
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-
 #include "namespace.h"
 
 #include <ctype.h>
@@ -66,7 +65,7 @@ __FBSDID("$FreeBSD$");
  * if we DB-fied the group and netgroup stuff all in one shot, but
  * for now I'm satisfied just to have something that works well
  * without requiring massive code changes.)
- * 
+ *
  * Therefore, to still permit the use of the local file and maintain
  * optimum NIS performance, we allow for the following conditions:
  *
@@ -138,9 +137,6 @@ struct netgrp {
 	struct netgrp	*ng_next;	/* Chain ptr */
 	char		*ng_str[3];	/* Field pointers, see below */
 };
-#define NG_HOST		0	/* Host name */
-#define NG_USER		1	/* User name */
-#define NG_DOM		2	/* and Domain name */
 
 struct netgr_state {
 	FILE		*st_netf;
@@ -149,26 +145,53 @@ struct netgr_state {
 	struct netgrp	*st_gr;
 	char		*st_grname;
 };
+
+#define NG_HOST		0	/* Host name */
+#define NG_USER		1	/* User name */
+#define NG_DOM		2	/* and Domain name */
+
 static void	netgr_endstate(void *);
 NSS_TLS_HANDLING(netgr);
+
 static int	files_endnetgrent(void *, void *, va_list);
 static int	files_getnetgrent_r(void *, void *, va_list);
-static int	files_innetgr(void *, void *, va_list);
 static int	files_setnetgrent(void *, void *, va_list);
 
-struct netgr_state compat_state;
 static int	compat_endnetgrent(void *, void *, va_list);
-static int	compat_getnetgrent_r(void *, void *, va_list);
 static int	compat_innetgr(void *, void *, va_list);
+static int	compat_getnetgrent_r(void *, void *, va_list);
 static int	compat_setnetgrent(void *, void *, va_list);
+static void	_compat_clearstate(void);
 
-static void	clear_state(struct netgr_state *);
 static int	parse_netgrp(const char *, struct netgr_state *, int);
 static struct linelist *read_for_group(const char *, struct netgr_state *, int);
 static int	_getnetgrent_r(char **, char **, char **, char *, size_t, int *,
 		    struct netgr_state *);
+static int	_innetgr_fallback(void *, void *, const char *, const char *,
+		    const char *, const char *);
+static int	innetgr_fallback(void *, void *, va_list);
 
 #define	LINSIZ	1024	/* Length of netgroup file line */
+
+static const ns_dtab getnetgrent_dtab[] = {
+	NS_COMPAT_CB(compat_getnetgrent_r, NULL)
+	NS_FILES_CB(files_getnetgrent_r, NULL)
+	{ NULL, NULL, NULL },
+};
+
+static const ns_dtab setnetgrent_dtab[] = {
+	NS_COMPAT_CB(compat_setnetgrent, NULL)
+	NS_FILES_CB(files_setnetgrent, NULL)
+	{ NULL, NULL, NULL },
+};
+
+static const ns_dtab endnetgrent_dtab[] = {
+	NS_COMPAT_CB(compat_endnetgrent, NULL)
+	NS_FILES_CB(files_endnetgrent, NULL)
+	{ NULL, NULL, NULL },
+};
+
+static struct netgr_state compat_state;
 
 static void
 netgr_endstate(void *arg)
@@ -205,17 +228,6 @@ netgr_endstate(void *arg)
 }
 
 static int
-files_endnetgrent(void *retval, void *mdata, va_list ap)
-{
-	struct netgr_state *st;
-
-	if (netgr_getstate(&st) != 0)
-		return (NS_UNAVAIL);
-	netgr_endstate(st);
-	return (NS_SUCCESS);
-}
-
-static int
 files_getnetgrent_r(void *retval, void *mdata, va_list ap)
 {
 	struct netgr_state *st;
@@ -234,33 +246,6 @@ files_getnetgrent_r(void *retval, void *mdata, va_list ap)
 		return (NS_UNAVAIL);
 
 	return (_getnetgrent_r(hostp, userp, domp, buf, bufsize, errnop, st));
-}
-
-static int
-files_innetgr(void *retval, void *mdata, va_list ap)
-{
-	const char *group, *host, *user, *dom;
-	char *h, *u, *d;
-
-	group = va_arg(ap, const char *);
-	host = va_arg(ap, const char *);
-	user = va_arg(ap, const char *);
-	dom = va_arg(ap, const char *);
-
-	if (group == NULL || group[0] == '\0')
-		return (NS_RETURN);
-
-	setnetgrent(group);
-	while (getnetgrent(&h, &u, &d))
-		if ((host == NULL || h == NULL || strcmp(host, h) != 0) &&
-		    (user == NULL || u == NULL || strcmp(user, u) != 0) &&
-		    (dom == NULL || d == NULL || strcmp(dom, d) != 0)) {
-			endnetgrent();
-			*(int *)retval = 1;
-			return (NS_SUCCESS);
-		}
-	endnetgrent();
-	return (NS_NOTFOUND);
 }
 
 static int
@@ -294,8 +279,40 @@ files_setnetgrent(void *retval, void *mdata, va_list ap)
 	return (st->st_grname != NULL ? NS_SUCCESS : NS_NOTFOUND);
 }
 
+static int
+files_endnetgrent(void *retval, void *mdata, va_list ap)
+{
+	struct netgr_state *st;
+
+	if (netgr_getstate(&st) != 0)
+		return (NS_UNAVAIL);
+	netgr_endstate(st);
+	return (NS_SUCCESS);
+}
+
+static int
+compat_getnetgrent_r(void *retval, void *mdata, va_list ap)
+{
+	char **hostp, **userp, **domp, *buf;
+	size_t bufsize;
+	int *errnop;
+#ifdef YP
+	_yp_innetgr = 0;
+#endif
+
+	hostp = va_arg(ap, char **);
+	userp = va_arg(ap, char **);
+	domp = va_arg(ap, char **);
+	buf = va_arg(ap, char *);
+	bufsize = va_arg(ap, size_t);
+	errnop = va_arg(ap, int *);
+
+	return (_getnetgrent_r(hostp, userp, domp, buf, bufsize, errnop,
+	    &compat_state));
+}
+
 /*
- * setnetgrent()
+ * compat_setnetgrent()
  * Parse the netgroup file looking for the netgroup and build the list
  * of netgrp structures. Let parse_netgrp() and read_for_group() do
  * most of the work.
@@ -313,12 +330,13 @@ compat_setnetgrent(void *retval, void *mdata, va_list ap)
 	group = va_arg(ap, const char *);
 
 	/* Sanity check */
-
 	if (group == NULL || !strlen(group))
 		return (NS_RETURN);
 
-	if (compat_state.st_gr == NULL || strcmp(group, compat_state.st_grname) != 0) {
-		endnetgrent();
+	if (compat_state.st_gr == NULL ||
+	    strcmp(group, compat_state.st_grname) != 0) {
+		_compat_clearstate();
+
 #ifdef YP
 		/* Presumed guilty until proven innocent. */
 		_use_only_yp = 0;
@@ -357,9 +375,9 @@ compat_setnetgrent(void *retval, void *mdata, va_list ap)
 		if ((netf = fopen(_PATH_NETGROUP, "re"))) {
 			compat_state.st_netf = netf;
 #endif
-			if (parse_netgrp(group, &compat_state, 1))
-				endnetgrent();
-			else {
+			if (parse_netgrp(group, &compat_state, 1)) {
+				_compat_clearstate();
+			} else {
 				compat_state.st_grname = strdup(group);
 			}
 			if (netf)
@@ -367,6 +385,27 @@ compat_setnetgrent(void *retval, void *mdata, va_list ap)
 		}
 	}
 	compat_state.st_nextgrp = compat_state.st_gr;
+	return (NS_SUCCESS);
+}
+
+static void
+_compat_clearstate(void)
+{
+
+	netgr_endstate(&compat_state);
+#ifdef YP
+	_netgr_yp_enabled = 0;
+#endif
+}
+
+/*
+ * compat_endnetgrent() - cleanup
+ */
+static int
+compat_endnetgrent(void *retval, void *mdata, va_list ap)
+{
+
+	_compat_clearstate();
 	return (NS_SUCCESS);
 }
 
@@ -403,43 +442,6 @@ _getnetgrent_r(char **hostp, char **userp, char **domp, char *buf,
 #undef COPY_ELEM
 
 	return (NS_NOTFOUND);
-}
-
-/*
- * Get the next netgroup off the list.
- */
-static int
-compat_getnetgrent_r(void *retval, void *mdata, va_list ap)
-{
-	char **hostp, **userp, **domp, *buf;
-	size_t bufsize;
-	int *errnop;
-#ifdef YP
-	_yp_innetgr = 0;
-#endif
-
-	hostp = va_arg(ap, char **);
-	userp = va_arg(ap, char **);
-	domp = va_arg(ap, char **);
-	buf = va_arg(ap, char *);
-	bufsize = va_arg(ap, size_t);
-	errnop = va_arg(ap, int *);
-
-	return (_getnetgrent_r(hostp, userp, domp, buf, bufsize, errnop,
-	    &compat_state));
-}
-
-/*
- * endnetgrent() - cleanup
- */
-static int
-compat_endnetgrent(void *retval, void *mdata, va_list ap)
-{
-	netgr_endstate(&compat_state);
-#ifdef YP
-	_netgr_yp_enabled = 0;
-#endif
-	return (NS_SUCCESS);
 }
 
 #ifdef YP
@@ -521,7 +523,6 @@ static int
 compat_innetgr(void *retval, void *mdata, va_list ap)
 {
 	const char *group, *host, *user, *dom;
- 	char *hst, *usr, *dm;
 
 	group = va_arg(ap, const char *);
 	host = va_arg(ap, const char *);
@@ -529,22 +530,20 @@ compat_innetgr(void *retval, void *mdata, va_list ap)
 	dom = va_arg(ap, const char *);
 
 	/* Sanity check */
-	
+
 	if (group == NULL || !strlen(group))
 		return (NS_RETURN);
 
 #ifdef YP
 	_yp_innetgr = 1;
-#endif
 	setnetgrent(group);
-#ifdef YP
 	_yp_innetgr = 0;
 	/*
 	 * If we're in NIS-only mode, do the search using
 	 * NIS 'reverse netgroup' lookups.
-	 * 
+	 *
 	 * What happens with 'reverse netgroup' lookups:
-	 * 
+	 *
 	 * 1) try 'reverse netgroup' lookup
 	 *    1.a) if host is specified and user is null:
 	 *         look in netgroup.byhost
@@ -566,7 +565,7 @@ compat_innetgr(void *retval, void *mdata, va_list ap)
 		int ret;
 		if(yp_get_default_domain(&_netgr_yp_domain))
 			return (NS_NOTFOUND);
-		ret = _revnetgr_lookup(_netgr_yp_domain, 
+		ret = _revnetgr_lookup(_netgr_yp_domain,
 				      host?"netgroup.byhost":"netgroup.byuser",
 				      host?host:user, dom, group);
 		if (ret == 1) {
@@ -575,20 +574,83 @@ compat_innetgr(void *retval, void *mdata, va_list ap)
 		} else if (ret == 0 && dom != NULL)
 			return (NS_NOTFOUND);
 	}
-
-	setnetgrent(group);
 #endif /* YP */
 
-	while (getnetgrent(&hst, &usr, &dm))
-		if ((host == NULL || hst == NULL || !strcmp(host, hst)) &&
-		    (user == NULL || usr == NULL || !strcmp(user, usr)) &&
-		    ( dom == NULL ||  dm == NULL || !strcmp(dom, dm))) {
-			endnetgrent();
-			*(int *)retval = 1;
-			return (NS_SUCCESS);
+	return (_innetgr_fallback(retval, mdata, group, host, user, dom));
+}
+
+static int
+_innetgr_fallback(void *retval, void *mdata, const char *group, const char *host,
+    const char *user, const char *dom)
+{
+	const ns_src src[] = {
+		{ mdata, NS_SUCCESS },
+		{ NULL, 0 },
+	};
+	char *h, *u, *d;
+	char *buf;
+	size_t bufsize;
+	int rv, ret_errno;
+
+	if (group == NULL || group[0] == '\0')
+		return (NS_RETURN);
+
+	bufsize = NGRP_STORAGE_INITIAL;
+	buf = malloc(bufsize);
+	if (buf == NULL)
+		return (NS_UNAVAIL);
+
+	*(int *)retval = 0;
+
+	(void)_nsdispatch(NULL, setnetgrent_dtab, NSDB_NETGROUP, "setnetgrent",
+	    src, group);
+
+	for (;;) {
+		do {
+			ret_errno = 0;
+			rv = _nsdispatch(NULL, getnetgrent_dtab, NSDB_NETGROUP,
+			    "getnetgrent_r", src, &h, &u, &d, buf, bufsize,
+			    &ret_errno);
+			if (rv != NS_SUCCESS && ret_errno == ERANGE) {
+				bufsize *= 2;
+				if (bufsize > NGRP_STORAGE_MAX ||
+				    (buf = reallocf(buf, bufsize)) == NULL)
+					goto out;
+			}
+		} while (rv != NS_SUCCESS && ret_errno == ERANGE);
+
+		if (rv != NS_SUCCESS) {
+			if (rv == NS_NOTFOUND && ret_errno == 0)
+				rv = NS_SUCCESS;
+			break;
 		}
-	endnetgrent();
-	return (NS_NOTFOUND);
+
+		if ((host == NULL || h == NULL || strcmp(host, h) == 0) &&
+		    (user == NULL || u == NULL || strcmp(user, u) == 0) &&
+		    (dom == NULL || d == NULL || strcmp(dom, d) == 0)) {
+			*(int *)retval = 1;
+			break;
+		}
+	}
+
+out:
+	free(buf);
+	(void)_nsdispatch(NULL, endnetgrent_dtab, NSDB_NETGROUP, "endnetgrent",
+	    src);
+	return (rv);
+}
+
+static int
+innetgr_fallback(void *retval, void *mdata, va_list ap)
+{
+	const char *group, *host, *user, *dom;
+
+	group = va_arg(ap, const char *);
+	host = va_arg(ap, const char *);
+	user = va_arg(ap, const char *);
+	dom = va_arg(ap, const char *);
+
+	return (_innetgr_fallback(retval, mdata, group, host, user, dom));
 }
 
 /*
@@ -728,16 +790,17 @@ read_for_group(const char *group, struct netgr_state *st, int compat)
 	linep = NULL;
 
 	netf = st->st_netf;
-	while ((_netgr_yp_enabled && compat) || fgets(line, LINSIZ, netf) != NULL) {
+	while ((_netgr_yp_enabled && compat) ||
+	    fgets(line, LINSIZ, netf) != NULL) {
 		if (_netgr_yp_enabled) {
-			if (_netgr_yp_domain == NULL || _netgr_yp_domain[0] == '\0')
-				if(yp_get_default_domain(&_netgr_yp_domain))
+			if (_netgr_yp_domain == NULL)
+				if (yp_get_default_domain(&_netgr_yp_domain))
 					continue;
 			if (yp_match(_netgr_yp_domain, "netgroup", group,
 			    strlen(group), &result, &resultlen)) {
 				free(result);
 				if (_use_only_yp)
-					return ((struct linelist *)0);
+					return (NULL);
 				else {
 					_netgr_yp_enabled = 0;
 					continue;
@@ -763,17 +826,17 @@ read_for_group(const char *group, struct netgr_state *st, int compat)
 			pos++;
 		spos = pos;
 		while (*pos != ' ' && *pos != '\t' && *pos != '\n' &&
-			*pos != '\0')
+		    *pos != '\0')
 			pos++;
 		len = pos - spos;
 		while (*pos == ' ' || *pos == '\t')
 			pos++;
 		if (*pos != '\n' && *pos != '\0') {
-			lp = (struct linelist *)malloc(sizeof (*lp));
-			if (lp == NULL) 
+			lp = malloc(sizeof (*lp));
+			if (lp == NULL)
 				return (NULL);
 			lp->l_parsed = 0;
-			lp->l_groupname = (char *)malloc(len + 1);
+			lp->l_groupname = malloc(len + 1);
 			if (lp->l_groupname == NULL) {
 				free(lp);
 				return (NULL);
@@ -842,46 +905,28 @@ read_for_group(const char *group, struct netgr_state *st, int compat)
 	return (NULL);
 }
 
-void
-endnetgrent(void)
-{
-	static const ns_dtab dtab[] = {
-		NS_FILES_CB(files_endnetgrent, NULL)
-		NS_COMPAT_CB(compat_endnetgrent, NULL)
-		{ NULL, NULL, NULL }
-	};
-
-	(void)_nsdispatch(NULL, dtab, NSDB_NETGROUP, "endnetgrent", defaultsrc);
-}
-
 int
 getnetgrent_r(char **hostp, char **userp, char **domp, char *buf, size_t bufsize)
 {
-	static const ns_dtab dtab[] = {
-		NS_FILES_CB(files_getnetgrent_r, NULL)
-		NS_COMPAT_CB(compat_getnetgrent_r, NULL)
-		{ NULL, NULL, NULL },
-	};
 	int rv, ret_errno;
 
 	ret_errno = 0;
-	rv = _nsdispatch(NULL, dtab, NSDB_NETGROUP, "getnetgrent_r",
+	rv = _nsdispatch(NULL, getnetgrent_dtab, NSDB_NETGROUP, "getnetgrent_r",
 	    defaultsrc, hostp, userp, domp, buf, bufsize, &ret_errno);
-	if (rv == NS_SUCCESS)
+	if (rv == NS_SUCCESS) {
 		return (1);
-	else {
+	} else {
 		errno = ret_errno;
 		return (0);
 	}
 }
 
-static char	*ngrp_storage;
-static size_t	 ngrp_storage_size;
-
 int
 getnetgrent(char **hostp, char **userp, char **domp)
 {
-	int error, rv;
+	static char *ngrp_storage;
+	static size_t ngrp_storage_size;
+	int ret_errno, rv;
 
 	if (ngrp_storage == NULL) {
 		ngrp_storage_size = NGRP_STORAGE_INITIAL;
@@ -889,11 +934,13 @@ getnetgrent(char **hostp, char **userp, char **domp)
 		if (ngrp_storage == NULL)
 			return (0);
 	}
+
 	do {
-		rv = getnetgrent_r(hostp, userp, domp, ngrp_storage,
-		    ngrp_storage_size);
-		error = errno;
-		if (rv == 0 && error == ERANGE) {
+		ret_errno = 0;
+		rv = _nsdispatch(NULL, getnetgrent_dtab, NSDB_NETGROUP,
+		    "getnetgrent_r", defaultsrc, hostp, userp, domp,
+		    ngrp_storage, ngrp_storage_size, &ret_errno);
+		if (rv != NS_SUCCESS && ret_errno == ERANGE) {
 			ngrp_storage_size *= 2;
 			if (ngrp_storage_size > NGRP_STORAGE_MAX) {
 				free(ngrp_storage);
@@ -901,13 +948,35 @@ getnetgrent(char **hostp, char **userp, char **domp)
 				errno = ERANGE;
 				return (0);
 			}
-			ngrp_storage = realloc(ngrp_storage, ngrp_storage_size);
+			ngrp_storage = reallocf(ngrp_storage,
+			    ngrp_storage_size);
 			if (ngrp_storage == NULL)
 				return (0);
 		}
-	} while (rv == 0 && error == ERANGE);
+	} while (rv != NS_SUCCESS && ret_errno == ERANGE);
 
-	return (rv);
+	if (rv == NS_SUCCESS) {
+		return (1);
+	} else {
+		errno = ret_errno;
+		return (0);
+	}
+}
+
+void
+setnetgrent(const char *netgroup)
+{
+
+	(void)_nsdispatch(NULL, setnetgrent_dtab, NSDB_NETGROUP, "setnetgrent",
+	    defaultsrc, netgroup);
+}
+
+void
+endnetgrent(void)
+{
+
+	(void)_nsdispatch(NULL, endnetgrent_dtab, NSDB_NETGROUP, "endnetgrent",
+	    defaultsrc);
 }
 
 int
@@ -915,8 +984,8 @@ innetgr(const char *netgroup, const char *host, const char *user,
     const char *domain)
 {
 	static const ns_dtab dtab[] = {
-		NS_FILES_CB(files_innetgr, NULL)
 		NS_COMPAT_CB(compat_innetgr, NULL)
+		NS_FALLBACK_CB(innetgr_fallback)
 		{ NULL, NULL, NULL },
 	};
 	int result, rv;
@@ -924,17 +993,4 @@ innetgr(const char *netgroup, const char *host, const char *user,
 	rv = _nsdispatch(&result, dtab, NSDB_NETGROUP, "innetgr", defaultsrc,
 	    netgroup, host, user, domain);
 	return (rv == NS_SUCCESS ? result : 0);
-}
-
-void
-setnetgrent(const char *netgroup)
-{
-	static const ns_dtab dtab[] = {
-		NS_FILES_CB(files_setnetgrent, NULL)
-		NS_COMPAT_CB(compat_setnetgrent, NULL)
-		{ NULL, NULL, NULL },
-	};
-
-	(void)_nsdispatch(NULL, dtab, NSDB_NETGROUP, "setnetgrent", defaultsrc,
-		netgroup);
 }
