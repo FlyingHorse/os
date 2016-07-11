@@ -1467,7 +1467,9 @@ pci_lintr_request(struct pci_devinst *pi)
 {
 	struct businfo *bi;
 	struct slotinfo *si;
+#ifdef FIXED_UEFI
 	int bestpin, bestcount, pin;
+#endif
 
 	bi = pci_businfo[pi->pi_bus];
 	assert(bi != NULL);
@@ -1477,6 +1479,7 @@ pci_lintr_request(struct pci_devinst *pi)
 	 * assigned IRQs later when interrupts are routed.
 	 */
 	si = &bi->slotinfo[pi->pi_slot];
+#ifdef FIXED_UEFI
 	bestpin = 0;
 	bestcount = si->si_intpins[0].ii_count;
 	for (pin = 1; pin < 4; pin++) {
@@ -1488,7 +1491,11 @@ pci_lintr_request(struct pci_devinst *pi)
 
 	si->si_intpins[bestpin].ii_count++;
 	pi->pi_lintr.pin = bestpin + 1;
-	pci_set_cfgdata8(pi, PCIR_INTPIN, bestpin + 1);
+#else
+	si->si_intpins[pi->pi_func].ii_count++;
+	pi->pi_lintr.pin = pi->pi_func + 1;
+#endif
+	pci_set_cfgdata8(pi, PCIR_INTPIN, pi->pi_lintr.pin);
 }
 
 static void
@@ -1509,7 +1516,11 @@ pci_lintr_route(struct pci_devinst *pi)
 	 * is not yet assigned.
 	 */
 	if (ii->ii_ioapic_irq == 0)
+#ifdef FIXED_UEFI
 		ii->ii_ioapic_irq = ioapic_pci_alloc_irq();
+#else
+		ii->ii_ioapic_irq = 16 + (pi->pi_slot + pi->pi_lintr.pin) % 4;
+#endif
 	assert(ii->ii_ioapic_irq > 0);
 
 	/*
