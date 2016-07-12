@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <err.h>
 #include "../lib9p.h"
+#include "../backend/fs.h"
 #include "../transport/socket.h"
 
 int
