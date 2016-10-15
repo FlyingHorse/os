@@ -3978,10 +3978,15 @@ nfsrvd_reclaimcomplete(struct nfsrv_descript *nd, __unused int isdgram,
 		goto nfsmout;
 	}
 	NFSM_DISSECT(tl, uint32_t *, NFSX_UNSIGNED);
-	if (*tl == newnfs_true)
-		nd->nd_repstat = NFSERR_NOTSUPP;
-	else
-		nd->nd_repstat = nfsrv_checkreclaimcomplete(nd);
+
+	/* PoC to show ESXi is violating the RFCs
+	* if (*tl == newnfs_true)
+	*	nd->nd_repstat = NFSERR_NOTSUPP;
+	* else
+	*	nd->nd_repstat = nfsrv_checkreclaimcomplete(nd);
+	*
+	*/
+	nd->nd_repstat = nfsrv_checkreclaimcomplete(nd);
 nfsmout:
 	NFSEXITCODE2(error, nd);
 	return (error);
